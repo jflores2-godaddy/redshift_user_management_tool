@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "redshift-user-admin"
+version = "0.1.0"
+description = "CLI tool for managing Redshift user accounts"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]",
+    "redshift-connector",
+    "python-dateutil",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-mock",
+]
+
+[project.scripts]
+redshift-user-admin = "redshift_user_admin.cli:app"
