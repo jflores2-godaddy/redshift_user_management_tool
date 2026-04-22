@@ -1,6 +1,6 @@
 import pytest
 
-from redshift_user_admin.service import validate_username
+from redshift_user_admin.service import validate_group_name, validate_username
 
 
 class TestValidateUsername:
@@ -36,3 +36,12 @@ class TestValidateUsername:
     def test_invalid_usernames(self, username: str, reason: str) -> None:
         with pytest.raises(ValueError):
             validate_username(username)
+
+
+class TestValidateGroupName:
+    def test_valid(self) -> None:
+        assert validate_group_name("analytics_general_readers") == "analytics_general_readers"
+
+    def test_invalid(self) -> None:
+        with pytest.raises(ValueError):
+            validate_group_name("bad-group")

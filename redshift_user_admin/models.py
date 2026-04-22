@@ -16,3 +16,11 @@ class RecoveryResult:
     previous_valid_until: datetime | None
     new_valid_until: datetime
     temporary_password: str
+
+
+@dataclass(frozen=True)
+class CreateUserResult:
+    username: str
+    temporary_password: str
+    valid_until: datetime
+    default_group: str

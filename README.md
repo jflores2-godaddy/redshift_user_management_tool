@@ -1,11 +1,12 @@
 # redshift-user-admin
 
-CLI tool for managing Redshift user accounts. Built for internal engineers who need to inspect user details and recover locked-out accounts.
+CLI tool for managing Redshift user accounts. Built for internal engineers who need to inspect user details, create new logins, and recover locked-out accounts.
 
 ## Features
 
-- **info** -- Look up a Redshift user and display their username and password expiration date.
+- **info** -- Look up a Redshift user and display their username and password expiration date. Optional `--env-file` (repeatable) queries multiple clusters in one run.
 - **recover** -- Reset a user's password and extend their `VALID UNTIL` by 6 calendar months.
+- **create** -- Create a new user with a generated password, `VALID UNTIL` six calendar months ahead, and membership in the default group (see `REDSHIFT_DEFAULT_GROUP`). Supports multiple `--env-file` values so the same password and expiry are applied to more than one cluster after a single preflight across all targets.
 
 ## Prerequisites
 
@@ -34,6 +35,7 @@ Set the following environment variables before running the tool:
 | `REDSHIFT_ADMIN_USER`     | Yes      | --      | Admin username for authentication  |
 | `REDSHIFT_ADMIN_PASSWORD` | Yes      | --      | Admin password for authentication  |
 | `REDSHIFT_SSL`            | No       | `true`  | Enable SSL (`true`, `1`, or `yes`) |
+| `REDSHIFT_DEFAULT_GROUP`  | No       | `analytics_general_readers` | Group passed to `ALTER GROUP ... ADD USER` after `CREATE USER` |
 
 Example:
 
@@ -52,13 +54,33 @@ export REDSHIFT_ADMIN_PASSWORD=secret
 redshift-user-admin info <username>
 ```
 
-Example output:
+Example output (current shell environment only, no `--env-file`):
 
 ```
 User found
   username:    userx
   valid_until: 2026-05-31 23:59:59
 ```
+
+Query the same username on two clusters using env files (order matches the flags):
+
+```bash
+redshift-user-admin info userx --env-file bi.env --env-file sl.env
+```
+
+Example output when using multiple `--env-file` values:
+
+```
+[/path/to/bi.env]
+  User found
+    username:    userx
+    valid_until: 2026-05-31 23:59:59
+
+[/path/to/sl.env]
+  User not found
+```
+
+If the user is missing on every target, the command exits with code 1 and prints an error after all sections.
 
 ### Recover a user account
 
@@ -92,6 +114,28 @@ Skip the confirmation prompt with `--yes`:
 redshift-user-admin recover <username> --yes
 ```
 
+### Create a user
+
+The tool connects to each target, checks that the username is **not** already present (preflight), then asks for confirmation. After you confirm, it generates one password and one `VALID UNTIL` value and applies them to every target.
+
+Single cluster using your current shell environment:
+
+```bash
+redshift-user-admin create <username>
+```
+
+Two clusters (for example BI and Serverless dev), same password on both, using env files whose variables override the process environment for that step only:
+
+```bash
+redshift-user-admin create <username> --env-file bi.env --env-file sl.env --yes
+```
+
+Omit `--yes` to get the interactive confirmation prompt.
+
+**Partial failures:** If provisioning fails partway through a multi-target run, an earlier cluster may already contain the new user while a later one does not. The CLI prints which targets had already succeeded; fix Redshift state or retry as appropriate.
+
+**Prerequisites:** The admin user must be allowed to `CREATE USER` and `ALTER GROUP` for `REDSHIFT_DEFAULT_GROUP`, and that group must exist on each cluster.
+
 ## Testing
 
 ```bash
@@ -103,6 +147,6 @@ python -m pytest tests/ -v
 
 - Admin credentials are read from environment variables and never logged.
 - Generated passwords are printed exactly once and never persisted or logged.
-- The `recover` command requires interactive confirmation unless `--yes` is passed.
+- The `recover` and `create` commands require interactive confirmation unless `--yes` is passed.
 - Usernames are validated against a strict pattern (`^[A-Za-z][A-Za-z0-9_]{0,62}$`) and quoted as SQL identifiers to prevent injection.
 - Passwords are escaped for SQL string literals (no single quotes, double quotes, or backslashes in generated passwords).
