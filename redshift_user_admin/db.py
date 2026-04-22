@@ -59,3 +59,29 @@ def set_valid_until(conn: redshift_connector.Connection, username: str, valid_un
     ts = valid_until.strftime("%Y-%m-%d %H:%M:%S")
     conn.cursor().execute(f"ALTER USER {safe_user} VALID UNTIL '{ts}'")
     conn.commit()
+
+
+def create_user(
+    conn: redshift_connector.Connection,
+    username: str,
+    password: str,
+    valid_until: datetime,
+) -> None:
+    """Create a Redshift login with password and VALID UNTIL."""
+    safe_user = _quote_identifier(username)
+    safe_pass = _escape_password(password)
+    ts = valid_until.strftime("%Y-%m-%d %H:%M:%S")
+    conn.cursor().execute(
+        f"CREATE USER {safe_user} WITH PASSWORD '{safe_pass}' VALID UNTIL '{ts}'"
+    )
+    conn.commit()
+
+
+def add_user_to_group(
+    conn: redshift_connector.Connection, group_name: str, username: str
+) -> None:
+    """Add a user to a Redshift group."""
+    safe_group = _quote_identifier(group_name)
+    safe_user = _quote_identifier(username)
+    conn.cursor().execute(f"ALTER GROUP {safe_group} ADD USER {safe_user}")
+    conn.commit()
