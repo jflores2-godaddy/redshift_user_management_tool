@@ -40,27 +40,29 @@ Behavior:
 ```bash
 redshift-user-admin recover <username>
 redshift-user-admin recover <username> --yes
+redshift-user-admin recover <username> --env-file cluster-a.env --env-file cluster-b.env
 ```
 
 Behavior:
 
 - Validate username.
-- Connect to Redshift.
-- Query the user.
-- Display username, current `VALID UNTIL`, and new computed `VALID UNTIL`.
+- With no `--env-file`: connect using the process environment, query the user, then proceed.
+- With one or more `--env-file`: preflight each target; the user must exist on **all** targets or the command exits with an error before confirmation.
+- Display current `VALID UNTIL` (per target when using env files) and the single new `VALID UNTIL` (UTC now plus six calendar months).
 - Ask for confirmation before making changes (skip with `--yes`).
-- Generate a secure temporary password.
-- Execute password reset and `ALTER USER <username> VALID UNTIL '<timestamp>'`.
+- Generate one secure temporary password (same for every target when using multiple env files).
+- Execute password reset and `ALTER USER <username> VALID UNTIL '<timestamp>'` on each target.
 - Print the generated password once.
 - Do not log or persist the password.
 
 ## Extension Logic
 
-Implement "extend by 6 months" as:
+Implement "new expiry six months out" as:
 
-- `base_date = max(current_valid_until, now)` if `current_valid_until` exists, otherwise `base_date = now`.
-- `new_valid_until = base_date + 6 months`.
-- Use calendar-aware month arithmetic via `dateutil.relativedelta`, not `timedelta(days=180)`.
+- `base_date = now` in UTC (wall clock at execution time).
+- `new_valid_until = base_date + 6 months` using calendar-aware month arithmetic via `dateutil.relativedelta`, not `timedelta(days=180)`.
+
+The previous `VALID UNTIL` in Redshift is not used as the base for recovery or for default create expiry (create uses the same rule).
 
 ## Redshift Connection
 
@@ -160,13 +162,13 @@ User found
 ```bash
 $ redshift-user-admin recover userx
 User found
-  username:          userx
+  username:            userx
   current valid_until: 2026-05-31 23:59:59
   new valid_until:     2026-11-30 23:59:59
 
 This will:
   - reset password
-  - extend validity by 6 months
+  - set VALID UNTIL to 6 calendar months from now (UTC)
 
 Continue? [y/N]: y
 
@@ -180,7 +182,7 @@ Copy it now. It will not be shown again.
 
 - Username validation: valid and invalid inputs, SQL injection attempts.
 - Password generation: correct length, character class requirements, forbidden characters, uniqueness.
-- Valid-until extension: future date, past date, None, calendar-month edge cases.
+- Valid-until extension: always from UTC now; calendar-month edge cases.
 - Service behavior: mocked DB calls for get_user_info and recover_user.
 
 ## README

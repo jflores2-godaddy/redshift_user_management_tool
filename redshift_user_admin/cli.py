@@ -8,6 +8,7 @@ import typer
 from redshift_user_admin.config import load_config
 from redshift_user_admin.db import get_connection
 from redshift_user_admin.env_file import merged_environ
+from redshift_user_admin.models import UserInfo
 from redshift_user_admin.passwords import generate_password
 from redshift_user_admin.service import (
     UserAlreadyExistsError,
@@ -104,6 +105,15 @@ def info(
 @app.command()
 def recover(
     username: str = typer.Argument(..., help="Redshift username to recover"),
+    env_file: Annotated[
+        list[Path],
+        typer.Option(
+            "--env-file",
+            exists=True,
+            readable=True,
+            help="Env file (KEY=value or export ...). Repeat to recover the same user on multiple clusters with one password and one VALID UNTIL.",
+        ),
+    ] = [],
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
     """Recover a Redshift user account: reset password and extend validity."""
@@ -112,6 +122,90 @@ def recover(
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1)
+
+    targets = _create_targets(env_file)
+    use_env_files = bool(env_file)
+
+    if use_env_files:
+        found: list[tuple[str, UserInfo]] = []
+        for label, path in targets:
+            merged = merged_environ(path)
+            try:
+                config = load_config(merged)
+            except EnvironmentError as exc:
+                typer.echo(f"Configuration error ({label}): {exc}", err=True)
+                raise typer.Exit(code=1)
+            conn = None
+            try:
+                conn = get_connection(config)
+                user = get_user_info(conn, username)
+            except UserNotFoundError:
+                typer.echo(
+                    f"Error ({label}): User {username!r} does not exist in Redshift.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            except Exception as exc:
+                typer.echo(f"Connection error ({label}): {exc}", err=True)
+                raise typer.Exit(code=1)
+            finally:
+                if conn is not None:
+                    conn.close()
+            found.append((label, user))
+
+        preview_valid = compute_new_valid_until()
+        typer.echo("Preflight OK — user exists on all targets.")
+        typer.echo()
+        for label, user in found:
+            typer.echo(f"[{label}]")
+            typer.echo("  User found")
+            typer.echo(f"    username:            {user.username}")
+            typer.echo(f"    current valid_until: {_format_timestamp(user.valid_until)}")
+            typer.echo()
+        typer.echo(f"  new valid_until (all targets): {_format_timestamp(preview_valid)}")
+        typer.echo()
+        typer.echo("This will:")
+        typer.echo("  - reset password (same on every target)")
+        typer.echo("  - set VALID UNTIL to 6 calendar months from now (UTC), same on every target")
+        typer.echo()
+
+        if not yes:
+            confirmed = typer.confirm("Continue?", default=False)
+            if not confirmed:
+                typer.echo("Aborted.")
+                raise typer.Exit(code=0)
+
+        password = generate_password()
+        valid_until = compute_new_valid_until()
+
+        for idx, (label, path) in enumerate(targets):
+            merged = merged_environ(path)
+            config = load_config(merged)
+            try:
+                conn = get_connection(config)
+            except Exception as exc:
+                typer.echo(f"Connection error ({label}): {exc}", err=True)
+                _report_partial_recover(idx, targets)
+                raise typer.Exit(code=1)
+            try:
+                recover_user(
+                    conn,
+                    username,
+                    password=password,
+                    new_valid_until=valid_until,
+                )
+            except Exception as exc:
+                typer.echo(f"Error during recovery ({label}): {exc}", err=True)
+                _report_partial_recover(idx, targets)
+                raise typer.Exit(code=1)
+            finally:
+                conn.close()
+
+        typer.echo()
+        typer.echo(f"Temporary password:\n  {password}")
+        typer.echo()
+        typer.echo("Copy it now. It will not be shown again.")
+        return
 
     try:
         config = load_config()
@@ -127,16 +221,16 @@ def recover(
         conn.close()
         raise typer.Exit(code=1)
 
-    new_valid_until = compute_new_valid_until(user.valid_until)
+    new_valid_until = compute_new_valid_until()
 
     typer.echo("User found")
-    typer.echo(f"  username:          {user.username}")
+    typer.echo(f"  username:            {user.username}")
     typer.echo(f"  current valid_until: {_format_timestamp(user.valid_until)}")
     typer.echo(f"  new valid_until:     {_format_timestamp(new_valid_until)}")
     typer.echo()
     typer.echo("This will:")
     typer.echo("  - reset password")
-    typer.echo("  - extend validity by 6 months")
+    typer.echo("  - set VALID UNTIL to 6 calendar months from now (UTC)")
     typer.echo()
 
     if not yes:
@@ -146,8 +240,15 @@ def recover(
             conn.close()
             raise typer.Exit(code=0)
 
+    password = generate_password()
+    valid_until = compute_new_valid_until()
     try:
-        result = recover_user(conn, username)
+        result = recover_user(
+            conn,
+            username,
+            password=password,
+            new_valid_until=valid_until,
+        )
     except Exception as exc:
         typer.echo(f"Error during recovery: {exc}", err=True)
         raise typer.Exit(code=1)
@@ -223,7 +324,7 @@ def create(
         cfg = load_config(merged)
         typer.echo(f"  - {label}")
         typer.echo(f"      default group: {cfg.default_group}")
-    planned_valid = compute_new_valid_until(None)
+    planned_valid = compute_new_valid_until()
     typer.echo()
     typer.echo(f"  valid_until (after confirm): {_format_timestamp(planned_valid)}")
     typer.echo()
@@ -239,7 +340,7 @@ def create(
             raise typer.Exit(code=0)
 
     password = generate_password()
-    valid_until = compute_new_valid_until(None)
+    valid_until = compute_new_valid_until()
 
     for idx, (label, path) in enumerate(targets):
         merged = merged_environ(path)
@@ -278,12 +379,32 @@ def create(
 def _report_partial_create(
     failed_index: int, targets: list[tuple[str, Path | None]]
 ) -> None:
-    if failed_index <= 0:
-        return
-    typer.echo(
+    _report_partial_targets(
+        failed_index,
+        targets,
         "Earlier targets may already have this user created. "
         "Check Redshift and fix or drop the user before retrying.",
-        err=True,
     )
+
+
+def _report_partial_recover(
+    failed_index: int, targets: list[tuple[str, Path | None]]
+) -> None:
+    _report_partial_targets(
+        failed_index,
+        targets,
+        "Earlier targets may already have this user's password reset and VALID UNTIL updated. "
+        "Check Redshift and align state before retrying.",
+    )
+
+
+def _report_partial_targets(
+    failed_index: int,
+    targets: list[tuple[str, Path | None]],
+    earlier_message: str,
+) -> None:
+    if failed_index <= 0:
+        return
+    typer.echo(earlier_message, err=True)
     succeeded = [targets[i][0] for i in range(failed_index)]
     typer.echo(f"Succeeded before failure: {', '.join(succeeded)}", err=True)
