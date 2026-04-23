@@ -73,42 +73,40 @@ def get_user_info(conn: redshift_connector.Connection, username: str) -> UserInf
     return info
 
 
-def compute_new_valid_until(current_valid_until: datetime | None) -> datetime:
-    """Compute a new VALID UNTIL date extended by 6 calendar months.
-
-    Uses max(current_valid_until, now) as the base if current_valid_until
-    exists; otherwise uses now.
-    """
+def compute_new_valid_until() -> datetime:
+    """Compute VALID UNTIL as UTC now plus 6 calendar months."""
     now = datetime.now(tz=timezone.utc)
-
-    if current_valid_until is not None:
-        base = current_valid_until if current_valid_until.tzinfo else current_valid_until.replace(tzinfo=timezone.utc)
-        if base < now:
-            base = now
-    else:
-        base = now
-
-    return base + relativedelta(months=6)
+    return now + relativedelta(months=6)
 
 
-def recover_user(conn: redshift_connector.Connection, username: str) -> RecoveryResult:
+def recover_user(
+    conn: redshift_connector.Connection,
+    username: str,
+    *,
+    password: str | None = None,
+    new_valid_until: datetime | None = None,
+) -> RecoveryResult:
     """Recover a Redshift user account: reset password and extend validity.
+
+    New expiry is always anchored from UTC now (+6 months), not from the
+    previous VALID UNTIL. Optional ``password`` and ``new_valid_until`` allow
+    applying the same values across multiple clusters.
 
     Performs the password reset and VALID UNTIL update within a single
     logical transaction (both committed together).
     """
     info = get_user_info(conn, username)
-    new_valid_until = compute_new_valid_until(info.valid_until)
-    password = generate_password()
+    vu = new_valid_until if new_valid_until is not None else compute_new_valid_until()
+    pwd = password if password is not None else generate_password()
 
-    reset_user_password(conn, username, password)
-    set_valid_until(conn, username, new_valid_until)
+    reset_user_password(conn, username, pwd)
+    set_valid_until(conn, username, vu)
 
     return RecoveryResult(
         username=info.username,
         previous_valid_until=info.valid_until,
-        new_valid_until=new_valid_until,
-        temporary_password=password,
+        new_valid_until=vu,
+        temporary_password=pwd,
     )
 
 
@@ -129,7 +127,7 @@ def create_user_account(
     if password is None:
         password = generate_password()
     if valid_until is None:
-        valid_until = compute_new_valid_until(None)
+        valid_until = compute_new_valid_until()
 
     create_user(conn, username, password, valid_until)
     add_user_to_group(conn, default_group, username)

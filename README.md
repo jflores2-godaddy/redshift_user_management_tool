@@ -5,7 +5,7 @@ CLI tool for managing Redshift user accounts. Built for internal engineers who n
 ## Features
 
 - **info** -- Look up a Redshift user and display their username and password expiration date. Optional `--env-file` (repeatable) queries multiple clusters in one run.
-- **recover** -- Reset a user's password and extend their `VALID UNTIL` by 6 calendar months.
+- **recover** -- Reset a user's password and set `VALID UNTIL` to six calendar months from UTC now. Optional `--env-file` (repeatable) recovers the same login on multiple clusters with one password and one expiry after preflight.
 - **create** -- Create a new user with a generated password, `VALID UNTIL` six calendar months ahead, and membership in the default group (see `REDSHIFT_DEFAULT_GROUP`). Supports multiple `--env-file` values so the same password and expiry are applied to more than one cluster after a single preflight across all targets.
 
 ## Prerequisites
@@ -84,21 +84,23 @@ If the user is missing on every target, the command exits with code 1 and prints
 
 ### Recover a user account
 
+Recovery always sets the new `VALID UNTIL` from **UTC now plus six calendar months**, not from the user’s previous expiry. That keeps multi-cluster runs aligned; accounts that already had a much later expiry will get a shorter window until the next extension.
+
 ```bash
 redshift-user-admin recover <username>
 ```
 
-Example output:
+Example output (current shell environment only, no `--env-file`):
 
 ```
 User found
-  username:          userx
+  username:            userx
   current valid_until: 2026-05-31 23:59:59
   new valid_until:     2026-11-30 23:59:59
 
 This will:
   - reset password
-  - extend validity by 6 months
+  - set VALID UNTIL to 6 calendar months from now (UTC)
 
 Continue? [y/N]: y
 
@@ -107,6 +109,14 @@ Temporary password:
 
 Copy it now. It will not be shown again.
 ```
+
+Recover the same username on two clusters with one password and one `VALID UNTIL` (the user must exist on **every** target):
+
+```bash
+redshift-user-admin recover userx --env-file bi.env --env-file sl.env --yes
+```
+
+**Partial failures:** If recovery fails partway through a multi-target run, an earlier cluster may already have the new password and expiry while a later one does not. The CLI prints which targets had already succeeded; fix Redshift state before retrying.
 
 Skip the confirmation prompt with `--yes`:
 

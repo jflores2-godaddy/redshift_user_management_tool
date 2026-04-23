@@ -35,24 +35,55 @@ class TestGetUserInfo:
 
 
 class TestRecoverUser:
+    @patch("redshift_user_admin.service.compute_new_valid_until")
     @patch("redshift_user_admin.service.set_valid_until")
     @patch("redshift_user_admin.service.reset_user_password")
     @patch("redshift_user_admin.service.generate_password", return_value="T3st!Pass_word1")
     @patch("redshift_user_admin.service.fetch_user_info")
     def test_full_recovery_flow(
-        self, mock_fetch, mock_gen_pw, mock_reset_pw, mock_set_vu
+        self, mock_fetch, mock_gen_pw, mock_reset_pw, mock_set_vu, mock_compute_vu
     ) -> None:
         conn = MagicMock()
-        valid_until = datetime(2026, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
-        mock_fetch.return_value = UserInfo(username="bob", valid_until=valid_until)
+        previous_vu = datetime(2026, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
+        new_vu = datetime(2027, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+        mock_fetch.return_value = UserInfo(username="bob", valid_until=previous_vu)
+        mock_compute_vu.return_value = new_vu
 
         result = recover_user(conn, "bob")
 
         assert result.username == "bob"
-        assert result.previous_valid_until == valid_until
+        assert result.previous_valid_until == previous_vu
+        assert result.new_valid_until == new_vu
         assert result.temporary_password == "T3st!Pass_word1"
+        mock_compute_vu.assert_called_once_with()
         mock_reset_pw.assert_called_once_with(conn, "bob", "T3st!Pass_word1")
-        mock_set_vu.assert_called_once_with(conn, "bob", result.new_valid_until)
+        mock_set_vu.assert_called_once_with(conn, "bob", new_vu)
+
+    @patch("redshift_user_admin.service.set_valid_until")
+    @patch("redshift_user_admin.service.reset_user_password")
+    @patch("redshift_user_admin.service.generate_password")
+    @patch("redshift_user_admin.service.fetch_user_info")
+    def test_reuses_password_and_valid_until(
+        self, mock_fetch, mock_gen_pw, mock_reset_pw, mock_set_vu
+    ) -> None:
+        conn = MagicMock()
+        mock_gen_pw.side_effect = AssertionError("generate_password should not be called")
+        previous_vu = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        shared_vu = datetime(2027, 6, 1, tzinfo=timezone.utc)
+        mock_fetch.return_value = UserInfo(username="bob", valid_until=previous_vu)
+
+        result = recover_user(
+            conn,
+            "bob",
+            password="Fixed!Pass_word1",
+            new_valid_until=shared_vu,
+        )
+
+        assert result.temporary_password == "Fixed!Pass_word1"
+        assert result.new_valid_until == shared_vu
+        mock_gen_pw.assert_not_called()
+        mock_reset_pw.assert_called_once_with(conn, "bob", "Fixed!Pass_word1")
+        mock_set_vu.assert_called_once_with(conn, "bob", shared_vu)
 
     @patch("redshift_user_admin.service.fetch_user_info", return_value=None)
     def test_recover_raises_when_user_not_found(self, mock_fetch) -> None:
@@ -100,6 +131,7 @@ class TestCreateUserAccount:
         mock_add_group.assert_called_once_with(
             conn, "analytics_general_readers", "carol"
         )
+        mock_vu.assert_called_once_with()
 
     @patch("redshift_user_admin.service.add_user_to_group")
     @patch("redshift_user_admin.service.create_user")
