@@ -9,8 +9,10 @@ from redshift_user_admin.access_workflow import (
     grant_read_access,
     grant_write_access,
     group_exists,
+    group_has_schema_usage,
     resolve_writer_group,
     run_investigate,
+    run_inspect_group,
     summarize_investigate,
 )
 from redshift_user_admin.config import load_config
@@ -27,6 +29,7 @@ from redshift_user_admin.service import (
     get_user_info,
     recover_user,
     validate_group_name,
+    validate_relation_name,
     validate_schema_name,
     validate_username,
 )
@@ -133,6 +136,91 @@ def _print_investigate_human(rep, label: str) -> None:
         )
 
 
+def _print_inspect_group_human(rep, label: str) -> None:
+    """Print inspect-group report (SQL is already logged by queries)."""
+    typer.echo()
+    typer.echo(f"========== {label} ==========")
+    typer.echo(f"Host: {rep.host}    Database: {rep.database}")
+    typer.echo()
+    typer.echo("1. GROUP")
+    if not rep.group_found:
+        typer.echo(f"   Group {rep.group_name!r}: NOT FOUND")
+    else:
+        typer.echo(f"   Group: {rep.group_name}    members: {rep.member_total}")
+    typer.echo()
+    typer.echo("2. SCHEMA")
+    if not rep.schema_found:
+        typer.echo(f"   Schema {rep.schema!r}: NOT FOUND")
+    else:
+        typer.echo(f"   schema: {rep.schema}    owner: {rep.schema_owner}")
+    typer.echo()
+    typer.echo("3. SCHEMA GRANTS (SVV_SCHEMA_PRIVILEGES → this group)")
+    typer.echo(
+        "   (privilege_type only — admin_option is omitted; it requires "
+        "pg_user_has_admin_option on some clusters)"
+    )
+    if not rep.schema_privileges:
+        typer.echo("   (no rows — no explicit schema privileges for this identity/name)")
+    else:
+        for row in rep.schema_privileges:
+            typer.echo(f"   - {row.privilege_type}")
+    typer.echo()
+    typer.echo("4. RELATION GRANTS (SVV_RELATION_PRIVILEGES → this group)")
+    if rep.relation_filter:
+        typer.echo(f"   Filter: relation_name = {rep.relation_filter!r}")
+    scope = "this relation" if rep.relation_filter else "this schema"
+    typer.echo(
+        f"   Distinct relations with any grant in {scope}: {rep.relation_distinct_total}"
+    )
+    if rep.relation_priv_counts:
+        typer.echo("   Counts by privilege_type:")
+        for row in rep.relation_priv_counts:
+            typer.echo(f"   - {row.privilege_type}: {row.count}")
+    else:
+        typer.echo("   Counts by privilege_type: (none)")
+    if rep.relation_preview:
+        typer.echo("   Relation detail (privilege_type per row):")
+        for row in rep.relation_preview:
+            typer.echo(f"   - {row.relation_name}    {row.privilege_type}")
+    elif rep.relation_filter:
+        typer.echo(
+            "   Relation detail: (no rows — no explicit grants for this group on "
+            f"{rep.relation_filter!r} in this schema, or relation name mismatch)"
+        )
+    else:
+        typer.echo(
+            "   Per-relation rows: omitted (schema-only). "
+            "Pass --table <name> to list privilege types for one relation."
+        )
+    typer.echo()
+    typer.echo("--- Summary ---")
+    if not rep.group_found:
+        typer.echo("   Group exists: NO")
+    else:
+        typer.echo("   Group exists: YES")
+    if rep.schema_found:
+        typer.echo("   Schema exists: YES")
+        if group_has_schema_usage(rep.schema_privileges):
+            typer.echo("   Schema USAGE for group: YES (see section 3)")
+        else:
+            typer.echo(
+                "   Schema USAGE for group: NO / not visible — users in this group "
+                "may hit 'permission denied for schema'"
+            )
+    else:
+        typer.echo("   Schema exists: NO")
+    if rep.relation_distinct_total > 0:
+        typer.echo(
+            f"   Relation-level grants: {rep.relation_distinct_total} relation(s) "
+            "with at least one privilege"
+        )
+    else:
+        typer.echo(
+            "   Relation-level grants: none visible for this group in this schema "
+            "(SELECT/INSERT etc. may still be missing even with USAGE)"
+        )
+
+
 def _report_partial_grant(
     failed_index: int, targets: list[tuple[str, Path | None]]
 ) -> None:
@@ -196,6 +284,75 @@ def investigate(
             if conn is not None:
                 conn.close()
         _print_investigate_human(rep, label)
+
+
+@app.command("inspect-group")
+def inspect_group(
+    group_name: str = typer.Argument(..., help="Redshift group name (e.g. corporate_writers)"),
+    schema: str = typer.Argument(..., help="Target schema name (e.g. ba_corporate)"),
+    table: str | None = typer.Option(
+        None,
+        "--table",
+        "-t",
+        help="Optional relation name: show privilege_type rows for this table only.",
+    ),
+    env_file: Annotated[
+        list[Path],
+        typer.Option(
+            "--env-file",
+            exists=True,
+            readable=True,
+            help="Env file per cluster. Repeat for multiple clusters (e.g. BI then serverless).",
+        ),
+    ] = [],
+) -> None:
+    """Inspect a group's member count and explicit schema/relation grants (SVV) for triage.
+
+    Exits with an error if the group does not exist. Use --table to narrow relation grants
+    to one object. Requires catalog visibility for SVV views (typically superuser admin).
+    """
+    try:
+        validate_group_name(group_name)
+        validate_schema_name(schema)
+        if table is not None:
+            validate_relation_name(table)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    targets = _create_targets(env_file)
+
+    for label, path in targets:
+        merged = merged_environ(path)
+        try:
+            config = load_config(merged)
+        except OSError as exc:
+            typer.echo(f"Configuration error ({label}): {exc}", err=True)
+            raise typer.Exit(code=1)
+        conn = None
+        try:
+            conn = get_connection(config)
+            rep = run_inspect_group(
+                conn,
+                group_name=group_name,
+                schema=schema,
+                host=config.host,
+                database=config.database,
+                relation_name=table,
+            )
+        except Exception as exc:
+            typer.echo(f"Error ({label}): {exc}", err=True)
+            raise typer.Exit(code=1)
+        finally:
+            if conn is not None:
+                conn.close()
+        if not rep.group_found:
+            typer.echo(
+                f"Error ({label}): Group {group_name!r} does not exist in Redshift.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        _print_inspect_group_human(rep, label)
 
 
 @app.command("grant-access")

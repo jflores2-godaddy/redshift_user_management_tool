@@ -130,6 +130,52 @@ class TablePrivilegeRow:
     can_select: bool
 
 
+def matches_writer_recommendation(inspected_group: str, recommended: str | None) -> bool:
+    """True when the inspected group is the same as the heuristic writer (case-insensitive)."""
+    if not recommended:
+        return False
+    return inspected_group.lower() == recommended.lower()
+
+
+@dataclass(frozen=True)
+class GroupSchemaPrivilegeRow:
+    privilege_type: str
+
+
+def group_has_schema_usage(schema_privileges: tuple[GroupSchemaPrivilegeRow, ...]) -> bool:
+    """True if any explicit schema grant row includes USAGE."""
+    return any(p.privilege_type.upper() == "USAGE" for p in schema_privileges)
+
+
+@dataclass(frozen=True)
+class GroupRelationPrivilegeRow:
+    relation_name: str
+    privilege_type: str
+
+
+@dataclass(frozen=True)
+class GroupRelationPrivCountRow:
+    privilege_type: str
+    count: int
+
+
+@dataclass(frozen=True)
+class GroupInspectReport:
+    host: str
+    database: str
+    group_name: str
+    schema: str
+    group_found: bool
+    member_total: int
+    relation_filter: str | None
+    schema_found: bool
+    schema_owner: str | None
+    schema_privileges: tuple[GroupSchemaPrivilegeRow, ...]
+    relation_priv_counts: tuple[GroupRelationPrivCountRow, ...]
+    relation_distinct_total: int
+    relation_preview: tuple[GroupRelationPrivilegeRow, ...]
+
+
 @dataclass(frozen=True)
 class InvestigateReport:
     host: str
@@ -287,6 +333,147 @@ def run_investigate(
         schema_owner=schema_owner,
         sample_tables=tuple(sample_tables),
         table_privileges=tuple(priv_rows),
+    )
+
+
+def run_inspect_group(
+    conn: "redshift_connector.Connection",
+    *,
+    group_name: str,
+    schema: str,
+    host: str,
+    database: str,
+    relation_name: str | None = None,
+) -> GroupInspectReport:
+    """Read-only inspection: group membership count and SVV grants for a schema.
+
+    When ``relation_name`` is set, relation aggregates and optional detail rows are
+    restricted to that relation only.
+    """
+    cur = conn.cursor()
+
+    sql_group = "SELECT 1 FROM pg_group WHERE groname = %s"
+    log_sql(sql_group, (group_name,))
+    cur.execute(sql_group, (group_name,))
+    group_found = cur.fetchone() is not None
+
+    if not group_found:
+        return GroupInspectReport(
+            host=host,
+            database=database,
+            group_name=group_name,
+            schema=schema,
+            group_found=False,
+            member_total=0,
+            relation_filter=relation_name,
+            schema_found=False,
+            schema_owner=None,
+            schema_privileges=(),
+            relation_priv_counts=(),
+            relation_distinct_total=0,
+            relation_preview=(),
+        )
+
+    sql_member_count = (
+        "SELECT COUNT(*) FROM pg_user u "
+        "JOIN pg_group g ON u.usesysid = ANY(g.grolist) "
+        "WHERE g.groname = %s"
+    )
+    log_sql(sql_member_count, (group_name,))
+    cur.execute(sql_member_count, (group_name,))
+    crow = cur.fetchone()
+    member_total = int(crow[0]) if crow and crow[0] is not None else 0
+
+    sql_schema = (
+        "SELECT n.nspname AS schema_name, u.usename AS schema_owner "
+        "FROM pg_namespace n "
+        "JOIN pg_user u ON n.nspowner = u.usesysid "
+        "WHERE n.nspname = %s"
+    )
+    log_sql(sql_schema, (schema,))
+    cur.execute(sql_schema, (schema,))
+    srow = cur.fetchone()
+    schema_found = srow is not None
+    schema_owner = str(srow[1]) if srow else None
+
+    schema_priv_rows: list[GroupSchemaPrivilegeRow] = []
+    # Omit admin_option: selecting it can call pg_user_has_admin_option and fail
+    # for non-superuser admins (e.g. Redshift Serverless).
+    sql_sch_priv = (
+        "SELECT DISTINCT privilege_type FROM svv_schema_privileges "
+        "WHERE namespace_name = %s AND identity_name = %s "
+        "ORDER BY privilege_type"
+    )
+    params_sg: tuple[str, ...] = (schema, group_name)
+    log_sql(sql_sch_priv, params_sg)
+    cur.execute(sql_sch_priv, params_sg)
+    for r in cur.fetchall():
+        if r[0]:
+            schema_priv_rows.append(GroupSchemaPrivilegeRow(privilege_type=str(r[0])))
+
+    rel_filter_sql = ""
+    params_rel = params_sg
+    if relation_name:
+        rel_filter_sql = " AND relation_name = %s "
+        params_rel = (schema, group_name, relation_name)
+
+    count_rows: list[GroupRelationPrivCountRow] = []
+    sql_rel_counts = (
+        "SELECT privilege_type, COUNT(*) AS cnt FROM svv_relation_privileges "
+        "WHERE namespace_name = %s AND identity_name = %s "
+        f"{rel_filter_sql}"
+        "GROUP BY privilege_type ORDER BY privilege_type"
+    )
+    log_sql(sql_rel_counts, params_rel)
+    cur.execute(sql_rel_counts, params_rel)
+    for r in cur.fetchall():
+        if r[0] is not None and r[1] is not None:
+            count_rows.append(
+                GroupRelationPrivCountRow(privilege_type=str(r[0]), count=int(r[1]))
+            )
+
+    sql_rel_distinct = (
+        "SELECT COUNT(DISTINCT relation_name) FROM svv_relation_privileges "
+        "WHERE namespace_name = %s AND identity_name = %s "
+        f"{rel_filter_sql}"
+    )
+    log_sql(sql_rel_distinct, params_rel)
+    cur.execute(sql_rel_distinct, params_rel)
+    drow = cur.fetchone()
+    relation_distinct_total = int(drow[0]) if drow and drow[0] is not None else 0
+
+    preview_rows: list[GroupRelationPrivilegeRow] = []
+    if relation_name:
+        sql_rel_detail = (
+            "SELECT relation_name, privilege_type FROM svv_relation_privileges "
+            "WHERE namespace_name = %s AND identity_name = %s AND relation_name = %s "
+            "ORDER BY privilege_type"
+        )
+        log_sql(sql_rel_detail, params_rel)
+        cur.execute(sql_rel_detail, params_rel)
+        for r in cur.fetchall():
+            if r[0] and r[1]:
+                preview_rows.append(
+                    GroupRelationPrivilegeRow(
+                        relation_name=str(r[0]),
+                        privilege_type=str(r[1]),
+                    )
+                )
+
+    return GroupInspectReport(
+        host=host,
+        database=database,
+        group_name=group_name,
+        schema=schema,
+        group_found=True,
+        member_total=member_total,
+        relation_filter=relation_name,
+        schema_found=schema_found,
+        schema_owner=schema_owner,
+        schema_privileges=tuple(schema_priv_rows),
+        relation_priv_counts=tuple(count_rows),
+        relation_distinct_total=relation_distinct_total,
+        relation_preview=tuple(preview_rows),
     )
 
 
