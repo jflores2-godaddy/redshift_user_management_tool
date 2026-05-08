@@ -7,6 +7,8 @@ CLI tool for managing Redshift user accounts. Built for internal engineers who n
 - **info** -- Look up a Redshift user and display their username and password expiration date. Optional `--env-file` (repeatable) queries multiple clusters in one run.
 - **recover** -- Reset a user's password and set `VALID UNTIL` to six calendar months from UTC now. Optional `--env-file` (repeatable) recovers the same login on multiple clusters with one password and one expiry after preflight.
 - **create** -- Create a new user with a generated password, `VALID UNTIL` six calendar months ahead, and membership in the default group (see `REDSHIFT_DEFAULT_GROUP`). Supports multiple `--env-file` values so the same password and expiry are applied to more than one cluster after a single preflight across all targets.
+- **investigate** -- For a username and schema, print per-cluster checks: user row, group memberships, writer groups, sample table privileges (`HAS_TABLE_PRIVILEGE`), and schema owner. Use multiple `--env-file` values when you need to compare BI vs serverless before granting.
+- **grant-access** -- Grant read (`ALTER GROUP` to `REDSHIFT_DEFAULT_GROUP`), write (inferred or `--writer-group`, plus `GRANT` on the schema), or both; SQL is printed before it runs. Re-runs the same checks afterward for verification. Supports `--dry-run` and `--yes`.
 
 ## Prerequisites
 
@@ -146,6 +148,29 @@ Omit `--yes` to get the interactive confirmation prompt.
 
 **Prerequisites:** The admin user must be allowed to `CREATE USER` and `ALTER GROUP` for `REDSHIFT_DEFAULT_GROUP`, and that group must exist on each cluster.
 
+### Investigate access (DBA tickets)
+
+Run against every cluster you care about first (for example BI, then serverless), using one `--env-file` per cluster in that order:
+
+```bash
+redshift-user-admin investigate <username> <schema> --env-file bi.env --env-file sl.env
+```
+
+Each target prints its own section (host, database) plus user existence, groups, `%writer%` groups on that cluster, sample `HAS_TABLE_PRIVILEGE` results, and schema owner. SQL is echoed to the terminal as it runs. If you are unsure which cluster needs a change, compare the two sections, then run `grant-access` with only the relevant `--env-file` argument(s).
+
+### Grant access
+
+Read-only grants add the user to `REDSHIFT_DEFAULT_GROUP` (default `analytics_general_readers`). Write grants pick a `*_writers` group from the cluster when the schema name matches (for example `ba_ecommerce` → `ecommerce_writers`); if nothing matches, pass `--writer-group` explicitly.
+
+```bash
+redshift-user-admin grant-access <username> <schema> --access read --env-file bi.env --yes
+redshift-user-admin grant-access <username> <schema> --access both --env-file bi.env --env-file sl.env --dry-run
+```
+
+All `ALTER GROUP` / `GRANT` statements are printed before execution. With `--dry-run`, those statements are not executed (investigation `SELECT`s still run so the tool can resolve writer groups and show current state). Omit `--yes` for an interactive confirmation prompt.
+
+**Partial failures:** If a multi-target grant fails partway through, an earlier cluster may already have grants applied. The CLI prints which targets had succeeded before the failure.
+
 ## Testing
 
 ```bash
@@ -157,6 +182,7 @@ python -m pytest tests/ -v
 
 - Admin credentials are read from environment variables and never logged.
 - Generated passwords are printed exactly once and never persisted or logged.
-- The `recover` and `create` commands require interactive confirmation unless `--yes` is passed.
+- The `recover`, `create`, and `grant-access` commands require interactive confirmation unless `--yes` is passed (`grant-access` also supports `--dry-run`).
+- The `investigate` and `grant-access` commands print SQL (including `SELECT`s) to the terminal before execution; admin passwords are still never logged.
 - Usernames are validated against a strict pattern (`^[A-Za-z][A-Za-z0-9_]{0,62}$`) and quoted as SQL identifiers to prevent injection.
 - Passwords are escaped for SQL string literals (no single quotes, double quotes, or backslashes in generated passwords).
