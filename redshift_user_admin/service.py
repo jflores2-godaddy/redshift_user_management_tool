@@ -63,6 +63,17 @@ def validate_schema_name(name: str) -> str:
     return name
 
 
+def validate_relation_name(name: str) -> str:
+    """Validate a Redshift table/relation name for CLI filters (same rules as schemas)."""
+    if not VALID_USERNAME_RE.match(name):
+        raise ValueError(
+            f"Invalid relation (table) name {name!r}. "
+            "Must start with a letter, contain only letters/digits/underscores, "
+            "and be 1-63 characters long."
+        )
+    return name
+
+
 def ensure_user_absent(conn: redshift_connector.Connection, username: str) -> None:
     """Ensure the login does not exist; raises UserAlreadyExistsError if it does."""
     validate_username(username)

@@ -4,8 +4,11 @@ from datetime import datetime, timezone
 
 
 from redshift_user_admin.access_workflow import (
+    GroupSchemaPrivilegeRow,
     InvestigateReport,
     TablePrivilegeRow,
+    group_has_schema_usage,
+    matches_writer_recommendation,
     pick_sample_tables,
     recommend_writer_group,
     summarize_investigate,
@@ -51,6 +54,30 @@ class TestPickSampleTables:
 
     def test_empty(self) -> None:
         assert pick_sample_tables([], 3) == []
+
+
+class TestMatchesWriterRecommendation:
+    def test_case_insensitive_match(self) -> None:
+        assert matches_writer_recommendation("Corporate_Writers", "corporate_writers") is True
+
+    def test_no_recommended(self) -> None:
+        assert matches_writer_recommendation("corporate_writers", None) is False
+
+    def test_mismatch(self) -> None:
+        assert matches_writer_recommendation("ecommerce_writers", "corporate_writers") is False
+
+
+class TestGroupHasSchemaUsage:
+    def test_usage_present(self) -> None:
+        rows = (GroupSchemaPrivilegeRow("USAGE"),)
+        assert group_has_schema_usage(rows) is True
+
+    def test_usage_missing(self) -> None:
+        rows = (GroupSchemaPrivilegeRow("CREATE"),)
+        assert group_has_schema_usage(rows) is False
+
+    def test_empty(self) -> None:
+        assert group_has_schema_usage(()) is False
 
 
 class TestSummarizeInvestigate:
